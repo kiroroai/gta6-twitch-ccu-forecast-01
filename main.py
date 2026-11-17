@@ -58,6 +58,13 @@ SUSPECT_MARKERS = (
 
 TIER_RE = re.compile(r"Tier:\s*([a-z][a-z\-]*)")
 
+# Tuning knobs, chosen on leave-one-out cross-validation over the clean
+# comparable launches (see the build notes): the size slope is shrunk
+# toward zero because it is estimated from few launches, and the spread
+# is left at its empirical scale.
+BETA_SHRINK = 1.0
+SPREAD_SCALE = 1.2
+
 
 def parse_time(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
@@ -171,7 +178,7 @@ def fit_shape(curves, log_p):
             num += w * x * (r - mean)
             den += w * x * x
     beta = num / den if den > 1e-9 else 0.0
-    beta = max(-0.45, min(0.05, 0.8 * beta))
+    beta = max(-0.45, min(0.05, BETA_SHRINK * beta))
 
     # Per-hour intercepts, then a light 3-point smoothing across hours.
     alpha = {}
@@ -234,7 +241,7 @@ def fit_shape(curves, log_p):
         # Shrink the hour's spread halfway toward the pooled spread.
         hour_sd = math.sqrt(0.5 * hour_sd * hour_sd + 0.5 * pooled_sd * pooled_sd)
         hour_sd = max(0.22, min(0.85, hour_sd))
-        scale = hour_sd / pooled_sd
+        scale = (hour_sd / pooled_sd) * SPREAD_SCALE
         median_log[h] = smoothed[h] + median_shift
         offsets[h] = {
             tau: (resid_q[tau] - median_shift) * scale for tau in LEVELS
