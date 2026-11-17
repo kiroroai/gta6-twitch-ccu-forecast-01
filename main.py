@@ -4,40 +4,48 @@
 Reads one case file per run (schema makefun/twitch-ccu-case/v1) and writes,
 for hours 2..24, five quantiles of that hour's concurrent-viewer count.
 
-Method (everything is computed from the case itself at run time):
+Method (everything is fitted from the case itself at run time):
 
-  * Every past launch in `comparables` is reduced to its release-day
-    shape: the log ratio ln(viewers_h / viewers_1) of each hour against
-    its own first hour. The case's hour-1 print anchors the level, the
-    comparables supply the shape.
-  * Launches differ systematically with size: the bigger the first-hour
-    audience, the less the day still grows (the pooled slope of log
-    ratio on log hour-1 size across comparable launches is about -0.3).
-    Each comparable's ratios are shifted by that slope times its log
-    size distance to this case before any quantile is taken, so the
-    shape pool is centred on a launch of this case's size.
-  * Comparables are weighted by how much their release resembles this
-    one, read from the case notes and each comparable's unlock text:
-    rolling midnight-local console launches count most for a rolling
-    console case, simultaneous global unlocks and early-access-shaped
-    days are downweighted, weak analogues barely count.
-  * The five quantiles of each hour are the weighted quantiles of the
-    size-adjusted log ratios, with the spread around the median scaled
-    by 0.85 and capped, because launch days disagree a little less than
-    the raw pool suggests once size and release type are accounted for.
-  * Four weightings of that recipe (a balanced one, two that lean
-    harder on release-type matching, and one that takes the first six
-    hours from midnight-local launches only, whose post-midnight dip
-    the global launches never show) are averaged in log space. The
-    ensemble is steadier than any single weighting.
+  * Each past launch in `comparables` is reduced to its release-day shape:
+    the log ratio ln(viewers_h / viewers_1) of each hour against its own
+    first hour. The case's hour-1 print anchors the level; the comparables
+    supply the shape. Launches also carry a pre-release ramp: their hourly
+    counts in the hours before the release day, when the first regions
+    unlock, which the case's own `history_hourly` mirrors.
+  * For every hour block (2-6, 7-14, 15-24) and every quantile level, a
+    quantile regression of the log ratio on the log size distance
+    (ln hour-1 of the comparable minus ln hour-1 of the case) is fitted by
+    profiling the exact pinball objective over a slope grid: for a fixed
+    slope the best intercept is a weighted quantile of the adjusted
+    ratios, so the fit is exact, deterministic and fast. The hour's five
+    quantiles are the fitted lines read at the case's own size.
+  * Comparables are weighted by resemblance to the case: release-type
+    weights from the unlock text (rolling midnight-local console launches
+    count most for such a case, simultaneous global unlocks and
+    early-access-shaped days are downweighted), a Gaussian kernel on log
+    size distance, a kernel on the pre-release last-hour ratio, and a
+    kernel on the whole normalised pre-release ramp profile.
+  * For rolling launches the median regression also fits a coefficient on
+    the case's pre-release last-hour ratio: a launch whose early regions
+    already ran hot (or cold) against its first hour tends to keep that
+    offset through the day.
+  * When a rolling case's pre-release peak already doubles its first
+    hour, the two upper quantiles are drawn from a mixture that gives
+    30% weight to past launches that broke out (peak at least 4x their
+    first hour): such days carry a fatter upper tail than the pool's.
+  * The spread around the median is scaled by 0.88, the value the
+    leave-one-out validation below selects; quantile offsets are capped
+    at 2.2 log.
 
 Validation: leave-one-out over the 38 comparable launches, each one
 forecast from its own first hour plus the other 37 and scored with the
 contest's exact pinball-on-log loss. On the eight closest analogues of
 the practice launches (big single-player console releases) this scores
-0.273 against 0.346 for the previous version of this program and 0.460
+0.223 against 0.273 for the previous version of this program and 0.460
 for the persistence baseline; on a second analogue set with the big
-midnight shooters included, 0.282 against 0.335 and 0.406.
+midnight shooters included, 0.242 against 0.282 and 0.406; over all 37
+usable launches, 0.503 against 0.731. The recipe was confirmed on
+rotating holdout folds of the comparables before being frozen.
 
 Only the standard library is used. No network, no randomness, no clock:
 two runs on the same case write identical bytes.
@@ -52,30 +60,46 @@ from datetime import datetime
 
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 TIER_RE = re.compile(r"Tier:\s*([a-z][a-z\-]*)")
+BLOCKS = ((2, 6), (7, 14), (15, 24))
 
-# One ensemble member: how strongly each comparable trait is weighted,
-# and (for one member) up to which hour only midnight-local launches
-# may speak. The balanced member counts double in the average.
-MEMBERS = (
-    {"weight": 2.0, "weak": 0.20, "ea": 0.50, "global": 0.25,
-     "unknown": 0.60, "conly": 1.40, "withpc": 0.75, "early_h": 0},
-    {"weight": 1.0, "weak": 0.02, "ea": 1.00, "global": 0.02,
-     "unknown": 0.15, "conly": 1.40, "withpc": 0.75, "early_h": 0},
-    {"weight": 1.0, "weak": 0.05, "ea": 0.80, "global": 0.05,
-     "unknown": 0.25, "conly": 1.40, "withpc": 0.75, "early_h": 0},
-    {"weight": 1.0, "weak": 0.20, "ea": 0.50, "global": 0.25,
-     "unknown": 0.60, "conly": 1.40, "withpc": 0.75, "early_h": 6},
-)
+# Release-type weights (see member weights in the validation harness).
+W_WEAK = 0.20
+W_EA = 0.50
+W_GLOBAL = 0.25
+W_MIDNIGHT = 1.00
+W_UNKNOWN = 0.60
+W_CONLY = 1.60
+W_WITHPC = 0.60
 
-BETA_LO, BETA_HI = -0.30, 0.0   # pooled size slope, clamped
-SPREAD = 0.85                   # scale on the offsets from the median
-MAX_OFF = 1.8                   # cap on any quantile's log offset
+SIZE_BW = 2.5        # Gaussian kernel width on log size distance
+PRELAST_BW = 0.65    # kernel width on log pre-release last-hour ratio
+SHAPE_BW = 0.5       # kernel width on pre-release ramp profile distance
+MISS_FACTOR = 0.6    # weight factor when a kernel feature is missing
+
+BETA_LO, BETA_HI = -0.30, 0.0   # slope grid range for the size regression
+BETA_STEP = 0.05                # slope grid step (0.1 inside the 2-D fit)
+GAMMA_RANGE = 1.0               # pre-release coefficient grid [-1, 1]
+GAMMA_STEP = 0.1
+
+SPREAD = 0.88                   # scale on the offsets from the median
+MAX_OFF = 2.2                   # cap on any quantile's log offset
+BREAKOUT_PI = 0.3               # mixture weight of the breakout pool
+BREAKOUT_MARKER = 2.0           # case pre-release peak / hour 1 needed
+BREAKOUT_PEAK = 4.0             # a train launch's peak ratio to qualify
 MIN_H1 = 1000.0                 # a comparable needs a real first hour
 MIN_PRESENT = 15                # ... and most of its release day
+MIN_WEIGHT = 0.005
 
 
 def parse_time(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def block_of(hour):
+    for i, (lo, hi) in enumerate(BLOCKS):
+        if lo <= hour <= hi:
+            return i
+    return 2
 
 
 def release_day(comp):
@@ -103,6 +127,46 @@ def release_day(comp):
     return by_hour
 
 
+def hourly_offsets(comp):
+    """{offset_hours_from_day_start: viewers} for a comparable's points."""
+    try:
+        start = parse_time(comp["day_start"])
+    except (KeyError, TypeError, ValueError):
+        return {}
+    out = {}
+    for point in comp.get("hourly") or []:
+        viewers = point.get("viewers")
+        if not viewers or viewers <= 0:
+            continue
+        try:
+            when = parse_time(point["from"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        off = int(round((when - start).total_seconds() / 3600.0))
+        out[off] = float(viewers)
+    return out
+
+
+def pre_features(pre, h1):
+    """Pre-release features from {offset: viewers} at offsets <= 0."""
+    feats = {"pre_last": None, "pre_max24": None}
+    if not pre or not h1:
+        return feats, {}
+    if -1 in pre:
+        feats["pre_last"] = pre[-1] / h1
+    window = [pre[o] for o in range(-24, 0) if o in pre]
+    if window:
+        feats["pre_max24"] = max(window) / h1
+    prof = {}
+    vals = [math.log(pre[o]) for o in range(-13, 0) if o in pre and pre[o] > 0]
+    if len(vals) >= 6:
+        mu = sum(vals) / len(vals)
+        for o in range(-13, 0):
+            if o in pre and pre[o] > 0:
+                prof[o] = math.log(pre[o]) - mu
+    return feats, prof
+
+
 def traits(comp):
     """Release traits of one comparable, from its unlock note."""
     unlock = comp.get("unlock") or ""
@@ -124,45 +188,53 @@ def case_regime(case):
     """What kind of release this case is, from its own notes."""
     notes = (case.get("notes") or "").lower()
     rolling = "midnight local" in notes or "rolling" in notes
-    conly = any(tag in notes for tag in
-                ("ps5 only", "ps4 only", "console only", "switch only"))
+    conly = ("console only" in notes
+             or ("pc" not in notes and "stadia" not in notes))
     return rolling, conly
 
 
-def comparable_pool(case):
-    """Usable comparable shapes: [(log_h1, traits, {hour: log_ratio})]."""
-    pool = []
-    for comp in case.get("comparables") or []:
-        name = comp.get("name") or ""
-        if name.startswith("Grand Theft Auto VI category"):
-            continue  # the target's own pre-release category, no launch
-        day = release_day(comp)
-        first = day.get(1)
-        if not first or first < MIN_H1:
+def case_pre(case):
+    """The case's own pre-release hourly viewers: {offset: viewers}."""
+    try:
+        start = parse_time(case["day_start"])
+    except (KeyError, TypeError, ValueError):
+        return {}
+    out = {}
+    hourly = case.get("history_hourly") or []
+    if hourly:
+        for row in hourly:
+            viewers = row.get("viewers")
+            if not viewers or viewers <= 0:
+                continue
+            try:
+                when = parse_time(row["from"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            off = int(round((when - start).total_seconds() / 3600.0))
+            if off <= 0:
+                out[off] = float(viewers)
+        return out
+    # Fall back to bucketing the raw history points by hour.
+    buckets = {}
+    for point in case.get("history") or []:
+        viewers = point.get("viewers")
+        if not viewers or viewers <= 0:
             continue
-        present = sum(1 for h in range(2, 25) if h in day)
-        if present < MIN_PRESENT:
+        try:
+            when = parse_time(point["at"])
+        except (KeyError, TypeError, ValueError):
             continue
-        ratios = {h: math.log(v / first) for h, v in day.items() if h >= 2}
-        pool.append((math.log(first), traits(comp), ratios))
-    return pool
+        off = int(math.floor((when - start).total_seconds() / 3600.0))
+        if off <= 0:
+            buckets.setdefault(off, []).append(float(viewers))
+    return {off: sum(v) / len(v) for off, v in buckets.items()}
 
 
-def member_weight(tr, regime, member):
-    rolling, conly = regime
-    w = 1.0
-    if tr["weak"]:
-        w *= member["weak"]
-    if tr["ea"]:
-        w *= member["ea"]
-    if rolling:
-        if tr["global"]:
-            w *= member["global"]
-        elif not tr["midnight"]:
-            w *= member["unknown"]
-    if conly:
-        w *= member["conly"] if tr["console_only"] else member["withpc"]
-    return w
+def shape_dist(a, b):
+    common = [o for o in a if o in b]
+    if len(common) < 6:
+        return None
+    return math.sqrt(sum((a[o] - b[o]) ** 2 for o in common) / len(common))
 
 
 def weighted_quantile(pairs, level):
@@ -184,57 +256,172 @@ def weighted_quantile(pairs, level):
     return ordered[-1][0]
 
 
-def member_forecast(pool, regime, member, log_p, p):
-    """One ensemble member's forecast: {hour: [five quantiles]}."""
-    train = []
-    for log_first, tr, ratios in pool:
-        w = member_weight(tr, regime, member)
-        if w > 0.01:
-            train.append((log_first, w, ratios, tr["midnight"]))
-    if len(train) < 4:
-        return None
-    # Pooled size slope: how log ratios move with log hour-1 size,
-    # pooled over hours (each hour's ratios demeaned, sizes measured
-    # against this case's own log print).
-    num = 0.0
-    den = 0.0
-    for h in range(2, 25):
-        rows = [(lf, r[h], w) for lf, w, r, _ in train if h in r]
-        if not rows:
+def pinball_obj(pts, tau, alpha, beta, gam):
+    return sum(w * 2.0 * max(tau * (r - alpha - beta * x - gam * dz),
+                             (tau - 1.0) * (r - alpha - beta * x - gam * dz))
+               for x, r, w, dz in pts)
+
+
+def fit_beta(pts, tau, gam):
+    """Profile the pinball objective over the slope grid at fixed gamma."""
+    best = None
+    beta = BETA_LO
+    while beta <= BETA_HI + 1e-9:
+        adj = [(r - beta * x - gam * dz, w) for x, r, w, dz in pts]
+        alpha = weighted_quantile(adj, tau)
+        obj = pinball_obj(pts, tau, alpha, beta, gam)
+        if best is None or obj < best[0]:
+            best = (obj, beta)
+        beta += BETA_STEP
+    return best[1]
+
+
+def comparable_pool(case):
+    """Usable comparable launches with shapes, traits and pre features."""
+    pool = []
+    for comp in case.get("comparables") or []:
+        name = comp.get("name") or ""
+        if name.startswith("Grand Theft Auto VI category"):
+            continue  # the target's own pre-release category, no launch
+        day = release_day(comp)
+        first = day.get(1)
+        if not first or first < MIN_H1:
             continue
-        wsum = sum(w for _, _, w in rows)
-        mean = sum(v * w for _, v, w in rows) / wsum
-        for lf, v, w in rows:
-            x = lf - log_p
-            num += w * x * (v - mean)
-            den += w * x * x
-    beta = num / den if den > 1e-9 else 0.0
-    beta = max(BETA_LO, min(BETA_HI, beta))
+        present = sum(1 for h in range(2, 25) if h in day)
+        if present < MIN_PRESENT:
+            continue
+        offs = hourly_offsets(comp)
+        pre = {o: v for o, v in offs.items() if o <= 0}
+        feats, prof = pre_features(pre, first)
+        ratios = {h: math.log(v / first) for h, v in day.items() if h >= 2}
+        pool.append({
+            "log_h1": math.log(first),
+            "traits": traits(comp),
+            "ratios": ratios,
+            "peak_ratio": max([v / first for h, v in day.items() if h >= 2]
+                              or [1.0]),
+            "feat": feats,
+            "prof": prof,
+        })
+    return pool
 
-    pooled = []
-    per_hour = {}
-    for h in range(2, 25):
-        rows = train
-        if member["early_h"] and h <= member["early_h"]:
-            local = [t for t in train if t[3] and h in t[2]]
-            if len(local) >= 5:
-                rows = local
-        pairs = [(r[h] - beta * (lf - log_p), w)
-                 for lf, w, r, _ in rows if h in r]
-        if pairs:
-            per_hour[h] = pairs
-            pooled.extend(pairs)
-    if not pooled:
-        return None
-    pooled_q = {tau: weighted_quantile(pooled, tau) for tau in LEVELS}
 
-    out = {}
-    for h in range(2, 25):
-        pairs = per_hour.get(h)
-        if pairs is not None and len(pairs) >= 6:
-            qs = {tau: weighted_quantile(pairs, tau) for tau in LEVELS}
+def forecast_case(case):
+    known = case.get("known") or []
+    p = 1.0
+    if known:
+        viewers = known[0].get("viewers")
+        if viewers and viewers > 0:
+            p = float(viewers)
+    pool = comparable_pool(case)
+    if len(pool) < 4:
+        return persistence_forecast(p)
+    rolling, conly = case_regime(case)
+    log_p = math.log(p)
+    cpre = case_pre(case)
+    cfeat, cprof = pre_features(cpre, p)
+    zcase = math.log(cfeat["pre_last"]) if cfeat["pre_last"] else None
+
+    # Weights: release type, then kernels on size, pre-release last hour
+    # and the pre-release ramp profile.
+    train = []
+    for e in pool:
+        tr = e["traits"]
+        w = 1.0
+        if tr["weak"]:
+            w *= W_WEAK
+        if tr["ea"]:
+            w *= W_EA
+        if rolling:
+            if tr["global"]:
+                w *= W_GLOBAL
+            elif tr["midnight"]:
+                w *= W_MIDNIGHT
+            else:
+                w *= W_UNKNOWN
+        if conly:
+            w *= W_CONLY if tr["console_only"] else W_WITHPC
+        d = abs(e["log_h1"] - log_p)
+        w *= math.exp(-0.5 * (d / SIZE_BW) ** 2)
+        a = e["feat"]["pre_last"]
+        if a and cfeat["pre_last"]:
+            dd = abs(math.log(a) - math.log(cfeat["pre_last"]))
+            w *= math.exp(-0.5 * (dd / PRELAST_BW) ** 2)
         else:
-            qs = pooled_q
+            w *= MISS_FACTOR
+        dist = shape_dist(e["prof"], cprof)
+        if dist is not None:
+            w *= math.exp(-0.5 * (dist / SHAPE_BW) ** 2)
+        else:
+            w *= MISS_FACTOR
+        if w > MIN_WEIGHT:
+            dz = 0.0
+            if a and zcase is not None:
+                dz = math.log(a) - zcase
+            train.append((e, w, dz))
+    if len(train) < 4:
+        return persistence_forecast(p)
+
+    # Fit one slope (and, for rolling cases, one pre-release coefficient)
+    # per hour block and quantile level on the pooled block points.
+    slopes = {}
+    gammas = {}
+    for b in range(3):
+        pts = []
+        for e, w, dz in train:
+            for h in range(2, 25):
+                if block_of(h) == b and h in e["ratios"]:
+                    pts.append((e["log_h1"] - log_p, e["ratios"][h], w, dz))
+        gammas[b] = 0.0
+        for tau in LEVELS:
+            if rolling and tau == 0.5:
+                best = None
+                beta = BETA_LO
+                while beta <= BETA_HI + 1e-9:
+                    gam = -GAMMA_RANGE
+                    while gam <= GAMMA_RANGE + 1e-9:
+                        adj = [(r - beta * x - gam * dz, w)
+                               for x, r, w, dz in pts]
+                        alpha = weighted_quantile(adj, tau)
+                        obj = pinball_obj(pts, tau, alpha, beta, gam)
+                        if best is None or obj < best[0]:
+                            best = (obj, beta, gam)
+                        gam += GAMMA_STEP
+                    beta += 0.1
+                slopes[(b, tau)] = best[1]
+                gammas[b] = best[2]
+                continue
+            slopes[(b, tau)] = fit_beta(pts, tau, gammas[b])
+
+    case_breaky = bool(rolling and cfeat["pre_max24"]
+                       and cfeat["pre_max24"] >= BREAKOUT_MARKER)
+    rows = []
+    for h in range(2, 25):
+        b = block_of(h)
+        gam = gammas[b]
+        qs = {}
+        for tau in LEVELS:
+            beta = slopes[(b, tau)]
+            pairs = [(e["ratios"][h] - beta * (e["log_h1"] - log_p)
+                      - gam * dz, w)
+                     for e, w, dz in train if h in e["ratios"]]
+            if not pairs:
+                qs[tau] = 0.0
+                continue
+            if case_breaky and tau >= 0.75:
+                bpairs = [(e["ratios"][h] - beta * (e["log_h1"] - log_p)
+                           - gam * dz, w)
+                          for e, w, dz in train
+                          if h in e["ratios"] and e["peak_ratio"] >= BREAKOUT_PEAK]
+                if len(bpairs) >= 3:
+                    wm = sum(w for _, w in pairs)
+                    wb = sum(w for _, w in bpairs)
+                    mix = ([(v, w * (1.0 - BREAKOUT_PI)) for v, w in pairs]
+                           + [(v, w * BREAKOUT_PI * wm / wb)
+                              for v, w in bpairs])
+                    qs[tau] = weighted_quantile(mix, tau)
+                    continue
+            qs[tau] = weighted_quantile(pairs, tau)
         median = qs[0.5]
         row = []
         for tau in LEVELS:
@@ -246,8 +433,8 @@ def member_forecast(pool, regime, member, log_p, p):
             row.append(max(1.0, min(1e9, p * math.exp(median + off))))
         for i in range(1, 5):
             row[i] = max(row[i], row[i - 1])
-        out[h] = row
-    return out
+        rows.append({"hour": h, "q": [round(v, 2) for v in row]})
+    return {"hours": rows}
 
 
 def persistence_forecast(p):
@@ -261,49 +448,6 @@ def persistence_forecast(p):
             "hour": h,
             "q": [round(p * math.exp(z[tau] * spread), 2) for tau in LEVELS],
         })
-    return {"hours": rows}
-
-
-def forecast_case(case):
-    known = case.get("known") or []
-    p = 1.0
-    if known:
-        viewers = known[0].get("viewers")
-        if viewers and viewers > 0:
-            p = float(viewers)
-    pool = comparable_pool(case)
-    if len(pool) < 4:
-        return persistence_forecast(p)
-    regime = case_regime(case)
-    log_p = math.log(p)
-    total_w = 0.0
-    blended = None
-    for member in MEMBERS:
-        part = member_forecast(pool, regime, member, log_p, p)
-        if part is None:
-            continue
-        w = member["weight"]
-        total_w += w
-        if blended is None:
-            blended = {h: [w * math.log(v) for v in part[h]]
-                       for h in range(2, 25)}
-        else:
-            for h in range(2, 25):
-                for i in range(5):
-                    blended[h][i] += w * math.log(part[h][i])
-    if blended is None or total_w <= 0:
-        return persistence_forecast(p)
-    rows = []
-    for h in range(2, 25):
-        qs = []
-        prev = 0.0
-        for i in range(5):
-            value = math.exp(blended[h][i] / total_w)
-            value = max(1.0, min(1e9, value))
-            value = max(value, prev)
-            qs.append(round(value, 2))
-            prev = qs[-1]
-        rows.append({"hour": h, "q": qs})
     return {"hours": rows}
 
 
